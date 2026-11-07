@@ -22,9 +22,6 @@ jobs:
     permissions:
       contents: read
 
-    env:
-      BUILD_TOOLS_VERSION: '36.0.0'
-
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
@@ -54,8 +51,10 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Install Android Build Tools
-        run: sdkmanager "build-tools;${BUILD_TOOLS_VERSION}"
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools build-tools;36.0.0'
 
       - name: Install Web UI dependencies
         working-directory: web-ui
