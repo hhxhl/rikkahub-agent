@@ -1,0 +1,105 @@
+
+name: Build Hhxhl RikkaHub Agent
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch to build'
+        required: true
+        default: 'hhxhl-master'
+        type: string
+      upload_name:
+        description: 'Artifact name'
+        required: false
+        default: 'rikkahub-agent'
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    permissions:
+      contents: read
+
+    env:
+      BUILD_TOOLS_VERSION: '36.0.0'
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+          submodules: recursive
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: temurin
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Install Android Build Tools
+        run: sdkmanager "build-tools;${BUILD_TOOLS_VERSION}"
+
+      - name: Install Web UI dependencies
+        working-directory: web-ui
+        run: bun install
+
+      - name: Make gradlew executable
+        run: chmod +x gradlew
+
+      - name: Assemble release
+        run: ./gradlew :app:assembleRelease
+
+      - name: Sign APKs
+        uses: r0adkll/sign-android-release@v1
+        with:
+          releaseDirectory: app/build/outputs/apk/release
+          signingKeyBase64: ${{ secrets.SIGNING_KEY }}
+          alias: ${{ secrets.ALIAS }}
+          keyStorePassword: ${{ secrets.KEY_STORE_PASSWORD }}
+          keyPassword: ${{ secrets.KEY_PASSWORD }}
+        env:
+          BUILD_TOOLS_VERSION: ${{ env.BUILD_TOOLS_VERSION }}
+
+      - name: Collect signed APKs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          shopt -s nullglob
+
+          signed_apks=(app/build/outputs/apk/release/*-signed.apk)
+
+          if [ ${#signed_apks[@]} -eq 0 ]; then
+            echo "ERROR: No signed APK found!"
+            ls -lah app/build/outputs/apk/release || true
+            exit 1
+          fi
+
+          cp "${signed_apks[@]}" artifacts/
+          ls -lh artifacts
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.upload_name || 'rikkahub-agent' }}
+          path: artifacts/*.apk
+          if-no-files-found: error
+          retention-days: 10
