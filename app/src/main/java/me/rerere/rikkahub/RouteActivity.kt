@@ -31,7 +31,9 @@ import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
@@ -159,6 +161,8 @@ class RouteActivity : ComponentActivity() {
     private val settingsStore by inject<SettingsStore>()
     private var navStack: MutableList<NavKey>? = null
     private val pendingIntents = ArrayDeque<Intent>()
+    // A one-shot request to enter Voice Mode after an ACTION_ASSIST launch.
+    private var assistVoiceRequest by mutableIntStateOf(0)
 
     // Volume key listener registry — last registered handler wins
     internal val volumeKeyListeners = mutableListOf<(isVolumeUp: Boolean) -> Boolean>()
@@ -229,6 +233,15 @@ class RouteActivity : ComponentActivity() {
         val backStack = navStack ?: run {
             // Compose hasn't created the nav back stack yet; process once it's ready.
             pendingIntents.addLast(intent)
+            return
+        }
+        if (intent.action == Intent.ACTION_ASSIST) {
+            // Return to the most recent existing chat (the root is always a chat).
+            while (backStack.size > 1 && backStack.lastOrNull() !is Screen.Chat) {
+                backStack.removeLast()
+            }
+            // ChatPage consumes this after its real settings have loaded.
+            assistVoiceRequest++
             return
         }
         if (intent.getBooleanExtra(EXTRA_OPEN_CODEX_SETTINGS, false)) {
@@ -356,7 +369,10 @@ class RouteActivity : ComponentActivity() {
                                     id = Uuid.parse(key.id),
                                     text = key.text,
                                     files = key.files.map { it.toUri() },
-                                    nodeId = key.nodeId?.let { Uuid.parse(it) }
+                                    nodeId = key.nodeId?.let { Uuid.parse(it) },
+                                    // During navigation transitions only the top chat may respond.
+                                    assistVoiceRequest = if (backStack.lastOrNull() == key) assistVoiceRequest else 0,
+                                    onAssistVoiceRequestConsumed = { assistVoiceRequest = 0 },
                                 )
                             }
 

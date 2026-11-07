@@ -89,7 +89,14 @@ import kotlin.time.Duration.Companion.milliseconds
 import kotlin.uuid.Uuid
 
 @Composable
-fun ChatPage(id: Uuid, text: String?, files: List<Uri>, nodeId: Uuid? = null) {
+fun ChatPage(
+    id: Uuid,
+    text: String?,
+    files: List<Uri>,
+    nodeId: Uuid? = null,
+    assistVoiceRequest: Int = 0,
+    onAssistVoiceRequestConsumed: () -> Unit = {},
+) {
     val vm: ChatVM = koinViewModel(
         parameters = {
             parametersOf(id.toString())
@@ -140,6 +147,15 @@ fun ChatPage(id: Uuid, text: String?, files: List<Uri>, nodeId: Uuid? = null) {
     }
 
     val startVoiceMode = rememberVoiceModeStarter(vm, setting)
+
+    // Settings.init is true for ChatVM's initial placeholder settings. Wait until the
+    // configured ASR provider is loaded before trying to start Voice Mode.
+    LaunchedEffect(assistVoiceRequest, setting.init) {
+        if (assistVoiceRequest > 0 && !setting.init) {
+            onAssistVoiceRequestConsumed()
+            startVoiceMode()
+        }
+    }
 
     val inputState = vm.inputState
 
