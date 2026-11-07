@@ -278,8 +278,11 @@ class TtsController(
                         )
                     }
 
-                    // 仅预取当前分片后的固定窗口
-                    prefetchNextChunks(chunk.index)
+                    // Online TTS: keep the original prefetch timing unchanged.
+                    // System TTS: synthesize the current chunk first; only then prefetch.
+                    // A local TTS engine should not process future chunks before the first one.
+                    val isSystemTts = provider is TTSProviderSetting.SystemTTS
+                    if (!isSystemTts) prefetchNextChunks(chunk.index)
 
                     val response = try {
                         awaitOrCreate(chunk, provider)
@@ -290,6 +293,8 @@ class TtsController(
                         processedCount++
                         continue
                     }
+
+                    if (isSystemTts) prefetchNextChunks(chunk.index)
 
                     // 播放
                     try {
