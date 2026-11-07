@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-24.04
 
     env:
-      BUILD_TOOLS_VERSION: 36.0.0
+      BUILD_TOOLS_VERSION: '36.0.0'
 
     permissions:
       contents: read
@@ -57,7 +57,7 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
         with:
-          packages: 'platform-tools build-tools; ${{ env.BUILD_TOOLS_VERSION }}'
+          packages: 'platform-tools build-tools;${{ env.BUILD_TOOLS_VERSION }}'
 
       - name: Install Web UI dependencies
         working-directory: web-ui
@@ -77,8 +77,6 @@ jobs:
           alias: ${{ secrets.ALIAS }}
           keyStorePassword: ${{ secrets.KEY_STORE_PASSWORD }}
           keyPassword: ${{ secrets.KEY_PASSWORD }}
-        env:
-          BUILD_TOOLS_VERSION: ${{ env.BUILD_TOOLS_VERSION }}
 
       - name: Collect signed APKs
         shell: bash
