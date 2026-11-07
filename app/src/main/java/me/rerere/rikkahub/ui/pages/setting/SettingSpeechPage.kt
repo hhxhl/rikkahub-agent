@@ -575,6 +575,14 @@ private fun AddASRProviderButton(onAdd: (ASRProviderSetting) -> Unit) {
                     showBottomSheet = true
                 }
             )
+            DropdownMenuItem(
+                text = { Text("Android System ASR") },
+                onClick = {
+                    currentProvider = ASRProviderSetting.AndroidSystem()
+                    showTypeMenu = false
+                    showBottomSheet = true
+                }
+            )
         }
     }
 
@@ -842,6 +850,7 @@ private fun ASRProviderItem(
                             is ASRProviderSetting.Volcengine -> "Volcengine"
                             is ASRProviderSetting.MiMo -> "MiMo"
                             is ASRProviderSetting.Step -> "Step"
+                            is ASRProviderSetting.AndroidSystem -> "Android System ASR"
                         },
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant

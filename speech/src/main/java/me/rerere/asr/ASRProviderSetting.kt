@@ -11,7 +11,7 @@ sealed class ASRProviderSetting {
 
     // Describes our adapter, not every API offered by this vendor.
     val supportsServerVadVoiceMode: Boolean
-        get() = this is OpenAIRealtime || this is DashScope || this is Volcengine
+        get() = this is OpenAIRealtime || this is DashScope || this is Volcengine || this is AndroidSystem
 
     abstract fun copyProvider(
         id: Uuid = this.id,
@@ -174,6 +174,21 @@ sealed class ASRProviderSetting {
         }
     }
 
+    /**
+     * Uses the Android default RecognitionService (e.g. Marmalade STT).
+     * Audio recording, VAD and inference are owned by the selected service.
+     */
+    @Serializable
+    @SerialName("android_system")
+    data class AndroidSystem(
+        override val id: Uuid = Uuid.random(),
+        override val name: String = "Android System ASR",
+        val language: String = "zh-CN",
+    ) : ASRProviderSetting() {
+        override fun copyProvider(id: Uuid, name: String): ASRProviderSetting =
+            copy(id = id, name = name)
+    }
+
     companion object {
         val Types by lazy {
             listOf(
@@ -182,6 +197,7 @@ sealed class ASRProviderSetting {
                 Volcengine::class,
                 MiMo::class,
                 Step::class,
+                AndroidSystem::class,
             )
         }
     }

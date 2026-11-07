@@ -118,6 +118,9 @@
     <intent>
       <action android:name="android.intent.action.TTS_SERVICE" />
     </intent>
+    <intent>
+      <action android:name="android.speech.RecognitionService" />
+    </intent>
     <!-- Required so launch_app / list_installed_apps can see other launcher apps and so
          screen-time can resolve app names on Android 11+. QUERY_ALL_PACKAGES above is the
          catch-all; this is the safer alternative the system queries when it is denied. -->

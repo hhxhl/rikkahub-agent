@@ -22,6 +22,7 @@ import me.rerere.asr.ASRProviderSetting
 import me.rerere.asr.providers.DashScopeASRController
 import me.rerere.asr.providers.VolcengineASRController
 import me.rerere.asr.providers.OpenAIRealtimeASRController
+import me.rerere.asr.providers.SystemASRController
 import me.rerere.rikkahub.data.datastore.Settings
 import me.rerere.rikkahub.data.datastore.getCurrentChatModel
 import me.rerere.rikkahub.data.datastore.getSelectedASRProvider
@@ -132,6 +133,9 @@ private fun createVoiceAsr(context: Context, client: OkHttpClient, provider: ASR
         is ASRProviderSetting.Volcengine -> {
             check(provider.apiKey.isNotBlank()) { context.getString(R.string.chat_page_voice_configure_key) }
             VolcengineASRController(context, client, provider)
+        }
+        is ASRProviderSetting.AndroidSystem -> {
+            SystemASRController(context, provider)
         }
         else -> error(context.getString(R.string.chat_page_voice_no_endpointing))
     }

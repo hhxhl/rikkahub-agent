@@ -37,6 +37,7 @@ fun ASRProviderConfigure(
                     is ASRProviderSetting.Volcengine -> "Volcengine"
                     is ASRProviderSetting.MiMo -> "MiMo"
                     is ASRProviderSetting.Step -> "Step"
+                    is ASRProviderSetting.AndroidSystem -> "Android System ASR"
                 },
                 onValueChange = {},
                 readOnly = true,
@@ -62,6 +63,7 @@ fun ASRProviderConfigure(
             is ASRProviderSetting.Volcengine -> VolcengineASRConfiguration(setting, onValueChange)
             is ASRProviderSetting.MiMo -> MiMoASRConfiguration(setting, onValueChange)
             is ASRProviderSetting.Step -> StepASRConfiguration(setting, onValueChange)
+            is ASRProviderSetting.AndroidSystem -> AndroidSystemASRConfiguration(setting, onValueChange)
         }
     }
 }
@@ -543,4 +545,25 @@ private fun StepASRConfiguration(
             placeholder = { Text("热词1, 热词2, 热词3") }
         )
     }
+}
+
+
+@Composable
+private fun AndroidSystemASRConfiguration(
+    setting: ASRProviderSetting.AndroidSystem,
+    onValueChange: (ASRProviderSetting) -> Unit,
+) {
+    FormItem(
+        label = { Text("Recognition language") },
+        description = { Text("BCP-47 language hint sent to the Android recognition service.") },
+    ) {
+        OutlinedTextField(
+            value = setting.language,
+            onValueChange = { onValueChange(setting.copy(language = it)) },
+            modifier = Modifier.fillMaxWidth(),
+            placeholder = { Text("zh-CN") },
+            singleLine = true,
+        )
+    }
+    Text("Uses the Android default speech recognition service (such as Marmalade STT). Configure its local model in that app.")
 }
