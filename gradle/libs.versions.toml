@@ -82,7 +82,7 @@ genaiPrompt = "1.0.0-beta2"
 # SIGSEGVs. That is unrecoverable from Kotlin, so the accelerator fallback cannot catch
 # it. 0.13.1 has an identical public API (same classes, same tool-calling surface,
 # getTokenCount/getBenchmarkInfo/cancelProcess all present) and a working GPU path.
-litertlm = "0.13.1"
+litertlm = "0.19.1"
 snakeyaml = "2.6"
 
 [libraries]
