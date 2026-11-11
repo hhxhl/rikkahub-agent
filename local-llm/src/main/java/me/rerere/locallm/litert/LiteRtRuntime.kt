@@ -37,6 +37,7 @@ import me.rerere.locallm.AcceleratorProbe
 import me.rerere.locallm.BuildConfig
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.security.MessageDigest
 import java.util.concurrent.CancellationException
 import java.util.concurrent.TimeUnit
 
@@ -46,12 +47,24 @@ const val ROLE_USER = "user"
 const val ROLE_ASSISTANT = "assistant"
 
 /**
- * Stable, content-derived signature for one conversation turn. Used to decide whether the
- * warm [Conversation]'s KV cache can be reused (see [planTurns]). Length + hashCode keeps
- * the collision rate negligible; a collision would only cause a (correct) cold reload, never
- * wrong output.
+ * Content-derived SHA-256 signature for KV-cache prefix matching. String.hashCode() is
+ * not sufficient here: e.g. "Aa" and "BB" have identical length AND hashCode, which
+ * could incorrectly reuse the previous question's KV cache instead of rebuilding it.
  */
-fun turnSignature(role: String, text: String): String = "$role|${text.length}|${text.hashCode()}"
+fun turnSignature(role: String, text: String): String {
+    val digest = MessageDigest.getInstance("SHA-256")
+    digest.update(role.toByteArray(Charsets.UTF_8))
+    digest.update(0)
+    val bytes = digest.digest(text.toByteArray(Charsets.UTF_8))
+    val hex = "0123456789abcdef"
+    return buildString(bytes.size * 2) {
+        for (byte in bytes) {
+            val b = byte.toInt() and 0xff
+            append(hex[b ushr 4])
+            append(hex[b and 0xf])
+        }
+    }
+}
 
 /**
  * One rendered conversation turn handed from [LiteRtProvider] to [LiteRtRuntime].

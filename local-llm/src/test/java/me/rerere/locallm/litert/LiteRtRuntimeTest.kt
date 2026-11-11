@@ -153,6 +153,21 @@ class LiteRtRuntimeTest {
         assertFalse(turnSignature(ROLE_USER, "a") == turnSignature(ROLE_USER, "b"))
     }
 
+    @Test
+    fun `known Java hashCode collision cannot reuse wrong cached history`() {
+        // "Aa" and "BB" have the same UTF-16 length and Java String.hashCode().
+        assertEquals("Aa".hashCode(), "BB".hashCode())
+        val first = turnSignature(ROLE_USER, "Aa")
+        val edited = turnSignature(ROLE_USER, "BB")
+        assertFalse("content fingerprint must detect the edit", first == edited)
+        val plan = LiteRtRuntime.planTurns(
+            processed = listOf(first, turnSignature(ROLE_ASSISTANT, "yes")),
+            historySignatures = listOf(edited, turnSignature(ROLE_ASSISTANT, "yes"), u2),
+            hasMedia = false,
+        )
+        assertEquals(TurnPlan.Cold, plan)
+    }
+
     // ---- isVisionExecutorError -----------------------------------------------------
 
     @Test

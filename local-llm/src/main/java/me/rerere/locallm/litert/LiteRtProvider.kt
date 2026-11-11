@@ -266,38 +266,60 @@ class LiteRtProvider(
         val allTurns = messages.filter {
             it.role != MessageRole.SYSTEM && it.role != MessageRole.TOOL
         }
-        // Keep the newest turn unconditionally. If even this turn and the system do not
-        // fit, refuse BEFORE loading the engine rather than sending an oversized prefill.
-        val lastTurnChars = allTurns.lastOrNull()?.let {
-            renderColdBlob(listOf(it)).length
-        } ?: 0
+        // Reserve room for the latest user request and the most recent exchange BEFORE
+        // picking tools. On a 1280-token model it is better to drop a large tool schema
+        // than to silently forget what the previous assistant just said.
         val inputCharLimit = promptInputCharBudget(contextTokens)
-        if (combinedSystem.length.toLong() + lastTurnChars > inputCharLimit) {
-            throw IllegalArgumentException(
-                "The latest message and system prompt exceed this local model's estimated " +
-                    "input budget ($inputCharLimit characters for ${contextTokens}t). " +
-                    "Shorten the latest message or choose a model with more context.",
+        val latest = allTurns.takeLast(1)
+        val latestText = renderColdBlob(latest)
+        val latestFits = combinedSystem.length.toLong() + latestText.length <= inputCharLimit &&
+            LiteRtConversationPolicy.fits(
+                contextTokens, combinedSystem, emptyList(), latestText, latest.size,
             )
+        require(latestFits) {
+            "The latest message and system prompt exceed the local model's estimated " +
+                "context budget (${contextTokens} tokens). Shorten the prompt or choose " +
+                "a model with more context."
         }
 
-        // Each tool retains its full schema. Skip tools that will not fit; never truncate
-        // a JSON schema. Reserve at least half the input budget for non-tool content.
-        val toolCharBudget = toolDeclarationCharBudget(
-            contextTokens = contextTokens,
-            systemChars = combinedSystem.length,
-            lastTurnChars = lastTurnChars,
+        // Preserve up to the last three logical messages (usually user / assistant /
+        // latest user). A very large recent message may not fit, so keep the newest
+        // possible suffix. Tools then share the remaining space.
+        val recent = LiteRtConversationPolicy.trimOldestTurns(
+            allTurns.takeLast(3),
+            fits = { suffix ->
+                val rendered = renderColdBlob(suffix)
+                combinedSystem.length.toLong() + rendered.length <= inputCharLimit &&
+                    LiteRtConversationPolicy.fits(
+                        contextTokens, combinedSystem, emptyList(), rendered, suffix.size,
+                    )
+            },
+        )
+        val recentText = renderColdBlob(recent)
+        val charSpaceAfterRecent = (inputCharLimit.toLong() - combinedSystem.length -
+            recentText.length).coerceAtLeast(0L).toInt()
+        val toolCharBudget = minOf(
+            toolDeclarationCharBudget(contextTokens, combinedSystem.length, latestText.length),
+            charSpaceAfterRecent,
         )
         var toolCharsUsed = 0
         val droppedTools = mutableListOf<String>()
-        val declarations = params.tools.mapNotNull { tool ->
+        val declarations = mutableListOf<LiteRtToolDeclaration>()
+        val toolJsons = mutableListOf<String>()
+        for (tool in params.tools) {
             val declaration = LiteRtToolDeclaration(tool)
-            val cost = declaration.declarationJson.length
-            if (cost > toolCharBudget - toolCharsUsed) {
+            val json = declaration.declarationJson
+            val cost = json.length
+            val fitsCharacters = cost <= toolCharBudget - toolCharsUsed
+            val fitsTokens = LiteRtConversationPolicy.fits(
+                contextTokens, combinedSystem, toolJsons + json, recentText, recent.size,
+            )
+            if (!fitsCharacters || !fitsTokens) {
                 droppedTools += tool.name
-                null
             } else {
                 toolCharsUsed += cost
-                declaration
+                declarations += declaration
+                toolJsons += json
             }
         }
         val nativeTools: List<ToolProvider> = declarations.map { litertTool(it) }
@@ -316,18 +338,23 @@ class LiteRtProvider(
             )
         }
 
-        // History takes the space ACTUALLY left over after the chosen declarations.
-        // Old turns are removed first; the newest message must never be silently cut.
+        // The remaining history is allowed only if BOTH character and conservative
+        // token estimates fit. Drop whole oldest turns rather than truncating the latest
+        // question. Preserve an immediate prior assistant answer if it still fits.
         val historyLimit = historyCharBudget(contextTokens, combinedSystem.length, toolCharsUsed)
-        var trimmed = allTurns
-        var coldBlob = renderColdBlob(trimmed)
-        while (coldBlob.length > historyLimit && trimmed.size > 1) {
-            trimmed = trimmed.drop(1)
-            coldBlob = renderColdBlob(trimmed)
-        }
-        // The initial latest-turn check makes this unreachable under the same renderer;
-        // keep a defensive guard in case rendering rules change.
-        check(coldBlob.length <= historyLimit) {
+        val trimmed = LiteRtConversationPolicy.trimOldestTurns(
+            allTurns,
+            fits = { suffix ->
+                val blob = renderColdBlob(suffix)
+                blob.length <= historyLimit && LiteRtConversationPolicy.fits(
+                    contextTokens, combinedSystem, toolJsons, blob, suffix.size,
+                )
+            },
+        )
+        val coldBlob = renderColdBlob(trimmed)
+        check(coldBlob.length <= historyLimit && LiteRtConversationPolicy.fits(
+            contextTokens, combinedSystem, toolJsons, coldBlob, trimmed.size,
+        )) {
             "Newest local-model turn exceeds its remaining prompt budget"
         }
         val turns = trimmed.map { it.toTurn() }
@@ -338,8 +365,14 @@ class LiteRtProvider(
             "prefill budget: system=${combinedSystem.length} tools=$toolCharsUsed " +
                 "history=${coldBlob.length} total=${prefillChars}c " +
                 "(limit=${inputCharLimit}c, ~${prefillChars / CHARS_PER_TOKEN}t " +
-                "of ${contextTokens}t; estimated only)",
+                "of ${contextTokens}t; conservative token estimate=" +
+                "${LiteRtConversationPolicy.estimateTextTokens(combinedSystem) + " +
+                "toolJsons.sumOf { LiteRtConversationPolicy.estimateTextTokens(it) } + " +
+                "LiteRtConversationPolicy.estimateTextTokens(coldBlob)})",
         )
+        if (trimmed.size < allTurns.size) {
+            Log.i(TAG, "trimmed conversation history: ${allTurns.size} -> ${trimmed.size} turns")
+        }
 
         // Check the persisted vision-unavailable flag. If a prior load fell back to
         // text-only on this device, skip the GPU vision attempt entirely — saves ~1 s of
@@ -635,35 +668,9 @@ class LiteRtProvider(
         return Turn(turnRole, renderTurnRawText(this))
     }
 
-    /**
-     * The cold-path render of the (already SYSTEM/TOOL-filtered) history — what the runtime
-     * sends when it cannot reuse a warm KV cache.
-     *
-     * A single message is sent raw, so the SDK chat template wraps it cleanly (identical to
-     * the warm path). Multiple messages are crammed into one marker-formatted ChatML blob:
-     * Qwen/Gemma recognise the inner "User:/Assistant:" markers from their instruction-tuning
-     * data even when the template only wraps the OUTER content.
-     */
+    /** The SDK applies its own chat template around this single cold user message. */
     private fun renderColdBlob(messages: List<UIMessage>): String =
-        if (messages.size == 1) renderTurnRawText(messages[0])
-        else renderHistoryAsChatML(messages)
-
-    private fun renderHistoryAsChatML(messages: List<UIMessage>): String = buildString {
-        var first = true
-        for (msg in messages) {
-            if (msg.role == MessageRole.SYSTEM || msg.role == MessageRole.TOOL) continue
-            if (!first) append("\n")
-            first = false
-            when (msg.role) {
-                MessageRole.USER -> append("User: ").append(renderTurnRawText(msg))
-                MessageRole.ASSISTANT -> append("Assistant: ").append(renderTurnRawText(msg))
-                else -> { /* unreachable — filtered above */ }
-            }
-        }
-        // Trailing assistant cue gives the model a clear "your turn" signal even after the
-        // chat template wraps the input. Cheap belt-and-braces vs. the model going silent.
-        if (isNotEmpty()) append("\nAssistant: ")
-    }
+        renderLiteRtColdHistory(messages.map { it.toTurn() })
 
     override suspend fun generateImage(
         providerSetting: ProviderSetting,
