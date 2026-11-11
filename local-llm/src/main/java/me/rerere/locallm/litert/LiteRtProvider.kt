@@ -422,8 +422,8 @@ class LiteRtProvider(
 
         // ---- Stream + cumulative→delta conversion ----
         //
-        // The SDK's MessageCallback.onMessage emits the CUMULATIVE response so far
-        // (Gallery's `partialResult` is consumed via a REPLACE-the-content path). But
+        // The runtime accumulates the SDK's onMessage chunks and emits the
+        // CUMULATIVE response so far. But
         // RikkaHub's downstream chunk-handling APPENDS each Text part (see
         // UIMessage.appendChunk in ai/ui/Message.kt: incoming Text parts are concatenated
         // onto the previous Text part). Emitting cumulative chunks straight through would

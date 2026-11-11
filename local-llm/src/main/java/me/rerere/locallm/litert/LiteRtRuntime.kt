@@ -80,8 +80,8 @@ data class RuntimeToolCall(val name: String, val argumentsJson: String)
  * surfaced rather than run here so the host can apply approval and the HARDLINE floor.
  */
 sealed interface StreamEvent {
-    /** The **cumulative** response so far, not a delta, same contract the SDK's
-     *  `MessageCallback` uses. Downstream computes deltas itself. */
+    /** The **cumulative** response assembled from SDK message chunks, not a delta.
+     *  Downstream computes deltas itself. */
     data class Delta(val cumulative: String) : StreamEvent
 
     /** Tool calls the model emitted this turn, in the order the model produced them. */
@@ -930,7 +930,7 @@ class LiteRtRuntime(private val context: Context) {
             // flow's coroutine in awaitClose to tell a natural end from a cancellation.
             val generationFinished = java.util.concurrent.atomic.AtomicBoolean(false)
             var firstMessageNs: Long = 0L
-            var lastCumulative = ""
+            val responseBuilder = StringBuilder()
             // How many of the message's tool calls have already been forwarded. The SDK
             // re-delivers the full list on each callback, so forward only the new tail.
             var emittedToolCalls = 0
@@ -949,8 +949,8 @@ class LiteRtRuntime(private val context: Context) {
                         }
                         val text = message.toString()
                         if (text.isNotEmpty()) {
-                            lastCumulative = text
-                            trySend(StreamEvent.Delta(text))
+                            responseBuilder.append(text)
+                            trySend(StreamEvent.Delta(responseBuilder.toString()))
                         }
                         val calls = message.toolCalls
                         if (calls.size > emittedToolCalls) {
@@ -965,13 +965,14 @@ class LiteRtRuntime(private val context: Context) {
                         }
                     }
                     override fun onDone() {
+                        val fullResponse = responseBuilder.toString()
                         // The Conversation's KV cache now holds [history…] + the assistant
                         // turn just generated. Record that so the NEXT call can warm-continue
                         // if it is a clean single-turn append. Mutating [processed] here is
                         // safe: the mutex is held for this whole streamTurns invocation.
                         instance.processed.clear()
                         instance.processed.addAll(historySignatures)
-                        instance.processed.add(turnSignature(ROLE_ASSISTANT, lastCumulative))
+                        instance.processed.add(turnSignature(ROLE_ASSISTANT, fullResponse))
                         // Stamp telemetry for the provider to read + persist.
                         val endNs = System.nanoTime()
                         val prefillMs = if (firstMessageNs > 0L)
@@ -982,7 +983,7 @@ class LiteRtRuntime(private val context: Context) {
                             prefillMs = prefillMs,
                             decodeMs = decodeMs,
                             inputCharCount = telemetryInputChars,
-                            outputCharCount = lastCumulative.length,
+                            outputCharCount = fullResponse.length,
                             specDecodingEngaged = instance.speculativeDecodingEngaged,
                         )
                         instance.lastUseAtMs = android.os.SystemClock.elapsedRealtime()
