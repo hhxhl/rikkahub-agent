@@ -6,7 +6,7 @@ import android.os.Build
 import android.os.PerformanceHintManager
 import android.os.Process
 import com.google.ai.edge.litertlm.Backend
-import com.google.ai.edge.litertlm.Capabilities
+import com.google.ai.edge.litertlm.ModelInfo
 import com.google.ai.edge.litertlm.Content
 import com.google.ai.edge.litertlm.Contents
 import com.google.ai.edge.litertlm.Conversation
@@ -467,11 +467,15 @@ class LiteRtRuntime(private val context: Context) {
 
         // Probe the file for speculative-decoding support BEFORE building the engine.
         val supportsSpeculativeDecoding = try {
-            Capabilities(modelPath).use { it.hasSpeculativeDecodingSupport() }
-        } catch (_: Throwable) {
-            false
+            ModelInfo.from(modelPath).use { info ->
+                (info as? ModelInfo.Llm)?.hasSpeculativeDecodingSupport() == true
+            }
+        } catch (_: Exception) {
+           false
         }
-        val effectiveSpeculativeDecoding = speculativeDecoding && supportsSpeculativeDecoding
+
+        val effectiveSpeculativeDecoding =
+            speculativeDecoding && supportsSpeculativeDecoding
 
         val desiredEngineKey = EngineKey(
             modelPath = modelPath,
