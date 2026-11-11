@@ -257,32 +257,42 @@ class LiteRtProvider(
             systemTextsRaw
         }
 
-        // Native tool calling. Every declared tool is handed to the runtime under its real
-        // name with its real JSON schema (see [LiteRtToolDeclaration]), so the model calls
-        // `web_fetch(url=...)` rather than a generic dispatcher: the model's own chat
-        // template renders the declarations, which is what these models were tuned on.
-        //
-        // The conversation sets `automaticToolCalling = false`, so the runtime hands the
-        // calls back and we republish them as ordinary tool parts. That keeps local models
-        // on the same execution path as every cloud provider: HARDLINE floor, approval
-        // prompt, auto-approve allowlist, and the per-turn wall-clock budget all apply.
-        // No system-prompt tool catalogue is needed, and none is added: a duplicate
-        // listing would only compete with the template's own rendering for context.
-        //
-        // Declarations are budgeted like every other part of the prompt, against the context
-        // the ENGINE was configured with just above. Budgeting against the file's ceiling
-        // instead is what let a prompt built for 32768 tokens reach an engine holding 4096:
-        // the catalog deliberately allocates less than the file can hold, so the two numbers
-        // differ by 8x on the Gemma 4 entries. A tool that does not fit is skipped rather
-        // than truncated: half a JSON schema would render a malformed declaration.
+        // ---- Shared prompt budget: system + newest turn + tools + older history ----
+        // Budget against the ENGINE allocation, not the model file's theoretical ceiling.
+        // Reserve half the window for output plus a chat-template margin. The SDK's real
+        // tokenizer remains authoritative; these character counts are only estimates.
         val contextTokens = effectiveMaxNumTokens
-        val toolCharBudget = toolDeclarationCharBudget(contextTokens)
+        val combinedSystem = trimmedSystemTexts.trim()
+        val allTurns = messages.filter {
+            it.role != MessageRole.SYSTEM && it.role != MessageRole.TOOL
+        }
+        // Keep the newest turn unconditionally. If even this turn and the system do not
+        // fit, refuse BEFORE loading the engine rather than sending an oversized prefill.
+        val lastTurnChars = allTurns.lastOrNull()?.let {
+            renderColdBlob(listOf(it)).length
+        } ?: 0
+        val inputCharLimit = promptInputCharBudget(contextTokens)
+        if (combinedSystem.length.toLong() + lastTurnChars > inputCharLimit) {
+            throw IllegalArgumentException(
+                "The latest message and system prompt exceed this local model's estimated " +
+                    "input budget ($inputCharLimit characters for ${contextTokens}t). " +
+                    "Shorten the latest message or choose a model with more context.",
+            )
+        }
+
+        // Each tool retains its full schema. Skip tools that will not fit; never truncate
+        // a JSON schema. Reserve at least half the input budget for non-tool content.
+        val toolCharBudget = toolDeclarationCharBudget(
+            contextTokens = contextTokens,
+            systemChars = combinedSystem.length,
+            lastTurnChars = lastTurnChars,
+        )
         var toolCharsUsed = 0
         val droppedTools = mutableListOf<String>()
         val declarations = params.tools.mapNotNull { tool ->
             val declaration = LiteRtToolDeclaration(tool)
             val cost = declaration.declarationJson.length
-            if (toolCharsUsed + cost > toolCharBudget) {
+            if (cost > toolCharBudget - toolCharsUsed) {
                 droppedTools += tool.name
                 null
             } else {
@@ -298,9 +308,6 @@ class LiteRtProvider(
                     "$toolCharsUsed/$toolCharBudget chars (context ${contextTokens}t)",
             )
         }
-        // Never drop tools silently: an assistant with a large enabled set on a small model
-        // loses real capability here, and that has to be visible when debugging why the
-        // model "ignored" a tool.
         if (droppedTools.isNotEmpty()) {
             Log.w(
                 TAG,
@@ -309,45 +316,29 @@ class LiteRtProvider(
             )
         }
 
-        val combinedSystem = trimmedSystemTexts.trim()
-
-        // ---- Conversation history → turn list + cold-path blob ----
-        //
-        // We hand the runtime BOTH:
-        //   - `turns`: the full (trimmed) turn list, each carrying a content signature. The
-        //     runtime uses these to decide whether its warm Conversation's KV cache already
-        //     holds a prefix of this history — if so it sends ONLY the new turn and reuses
-        //     the cache (Gallery's behaviour), instead of re-prefilling the whole history.
-        //   - `coldBlob`: the full render used only when the cache can't be reused (first
-        //     turn, edited/regenerated history, tool round-trip, config change). Always
-        //     correct, just not warm.
-        //
-        // TOOL-role messages are dropped here: their content is already represented inline
-        // in the immediately-preceding ASSISTANT message's Tool part output.
-        //
-        // Trimming: drop the oldest turns one at a time until the cold render fits under
-        // HISTORY_CHAR_BUDGET. A trimmed list is no longer a forward-only extension of what
-        // the Conversation already processed, so the runtime correctly falls back to a cold
-        // rebuild for that turn — exactly the behaviour we want when history is reshaped.
-        var trimmed = messages.filter {
-            it.role != MessageRole.SYSTEM && it.role != MessageRole.TOOL
-        }
+        // History takes the space ACTUALLY left over after the chosen declarations.
+        // Old turns are removed first; the newest message must never be silently cut.
+        val historyLimit = historyCharBudget(contextTokens, combinedSystem.length, toolCharsUsed)
+        var trimmed = allTurns
         var coldBlob = renderColdBlob(trimmed)
-        while (coldBlob.length > HISTORY_CHAR_BUDGET && trimmed.size > 1) {
+        while (coldBlob.length > historyLimit && trimmed.size > 1) {
             trimmed = trimmed.drop(1)
             coldBlob = renderColdBlob(trimmed)
         }
+        // The initial latest-turn check makes this unreachable under the same renderer;
+        // keep a defensive guard in case rendering rules change.
+        check(coldBlob.length <= historyLimit) {
+            "Newest local-model turn exceeds its remaining prompt budget"
+        }
         val turns = trimmed.map { it.toTurn() }
 
-        // Every piece of the prefill, so an overflow is visible in a bug report without a
-        // rebuild. The engine has no bounds check we can rely on here: a prompt past its
-        // token budget faults inside the native executor rather than returning an error.
         val prefillChars = combinedSystem.length + toolCharsUsed + coldBlob.length
         Log.i(
             TAG,
             "prefill budget: system=${combinedSystem.length} tools=$toolCharsUsed " +
                 "history=${coldBlob.length} total=${prefillChars}c " +
-                "(~${prefillChars / CHARS_PER_TOKEN}t of ${contextTokens}t)",
+                "(limit=${inputCharLimit}c, ~${prefillChars / CHARS_PER_TOKEN}t " +
+                "of ${contextTokens}t; estimated only)",
         )
 
         // Check the persisted vision-unavailable flag. If a prior load fell back to
@@ -384,12 +375,13 @@ class LiteRtProvider(
                 visionAccelerator = config.visionAccelerator ?: "gpu",
                 systemInstructionText = combinedSystem.ifBlank { null },
                 tools = nativeTools,
+                toolDeclarationJsons = declarations.map { it.declarationJson },
                 // Constrained decoding ON when this turn carries tools — matches Gallery's
                 // tool-task behaviour. The SDK projects the model's output into the @Tool
                 // call grammar so Gemma actually invokes runTool(...) via the bridge
                 // instead of producing free-form "I can't do that" text. OFF for plain
                 // chat turns to avoid biasing normal language.
-                constrainedDecoding = params.tools.isNotEmpty(),
+                constrainedDecoding = nativeTools.isNotEmpty(),
                 topK = config.topK,
                 topP = config.topP,
                 temperature = config.temperature,
@@ -763,29 +755,36 @@ class LiteRtProvider(
          *  docs that small models can't usefully consume). 500 chars ≈ 125 tokens. */
         private const val SYSTEM_MESSAGE_CHAR_BUDGET = 500
 
-        /** Hard char-cap for the rendered ChatML history. ~3000 chars ≈ 750 tokens. */
-        private const val HISTORY_CHAR_BUDGET = 3000
-
-        /** Rough chars-per-token used to turn a model's token context into a char budget. */
+        /** Rough chars-per-token proxy; NOT an exact tokenizer count. */
         private const val CHARS_PER_TOKEN = 4
 
-        /**
-         * Char budget for the joined native tool declarations, scaled to the model's
-         * context the way the system prompt and history already are.
-         *
-         * Declarations are prompt text: the chat template renders every one of them ahead
-         * of the conversation. Leaving them uncapped let an assistant with a large enabled
-         * tool set push tens of thousands of characters of JSON schema into a model whose
-         * whole context is a few thousand tokens, which is far more than the 3.5k chars
-         * system + history are allowed between them.
-         *
-         * Half the context is reserved for the response; the system prompt and history
-         * budgets come off the input half first, and the declarations get what is left.
-         */
-        internal fun toolDeclarationCharBudget(contextTokens: Int): Int =
-            (contextTokens * CHARS_PER_TOKEN / 2) -
-                SYSTEM_MESSAGE_CHAR_BUDGET -
-                HISTORY_CHAR_BUDGET
+        /** Additional space for chat-template wrappers and uncounted special tokens. */
+        private const val PROMPT_TEMPLATE_CHAR_RESERVE = 256
+
+        /** Half of the engine context is reserved for generation, then template overhead. */
+        internal fun promptInputCharBudget(contextTokens: Int): Int =
+            (contextTokens.toLong().coerceAtLeast(0) * CHARS_PER_TOKEN / 2 -
+                PROMPT_TEMPLATE_CHAR_RESERVE).coerceIn(0L, Int.MAX_VALUE.toLong()).toInt()
+
+        /** Tools share the prompt with ACTUAL system and newest-turn text, not the maximum
+         * history cap. The other half of the input budget is reserved for conversation. */
+        internal fun toolDeclarationCharBudget(
+            contextTokens: Int,
+            systemChars: Int,
+            lastTurnChars: Int,
+        ): Int {
+            val limit = promptInputCharBudget(contextTokens)
+            val remaining = (limit.toLong() - systemChars - lastTurnChars).coerceAtLeast(0)
+            return minOf(limit.toLong() / 2, remaining).toInt()
+        }
+
+        /** Entire history, including the newest turn, must fit after tool selection. */
+        internal fun historyCharBudget(
+            contextTokens: Int,
+            systemChars: Int,
+            toolChars: Int,
+        ): Int = (promptInputCharBudget(contextTokens).toLong() -
+            systemChars - toolChars).coerceAtLeast(0).toInt()
 
         /**
          * The context the engine is actually configured with: what was asked for, clamped to

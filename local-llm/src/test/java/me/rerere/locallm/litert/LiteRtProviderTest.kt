@@ -79,59 +79,48 @@ class LiteRtProviderTest {
     }
 }
 
-/**
- * Budget tests for the native tool declarations.
- *
- * Tool declarations are prompt text: the chat template renders each one ahead of the
- * conversation. They were the one part of the prefill with no cap, so an assistant with a
- * large enabled tool set pushed tens of thousands of characters of JSON schema into a model
- * whose whole context is a few thousand tokens. The engine does not bounds-check that: it
- * faults inside the native executor rather than returning a context-overflow error.
- */
+/** Prompt budgets share one engine-sized input window rather than fixed maxima. */
 class LiteRtToolDeclarationBudgetTest {
 
-    private fun budget(contextTokens: Int) =
-        LiteRtProvider.toolDeclarationCharBudget(contextTokens)
+    private fun budget(contextTokens: Int, system: Int, last: Int) =
+        LiteRtProvider.toolDeclarationCharBudget(contextTokens, system, last)
 
     @Test
-    fun `budget leaves room for system prompt and history`() {
-        // 4096t * 4 chars / 2 = 8192 input chars, minus the 500 + 3000 already committed.
-        assertEquals(4692, budget(4096))
+    fun `1280 context no longer has negative tool budget for a new chat`() {
+        assertEquals(2304, LiteRtProvider.promptInputCharBudget(1280))
+        assertEquals(1152, budget(1280, 537, 2))
     }
 
     @Test
-    fun `budget scales with the model's context`() {
-        assertTrue(
-            "a 32k model must afford far more declarations than a 4k one",
-            budget(32768) > budget(4096) * 10,
-        )
+    fun `tool budget responds to actual system and latest turn`() {
+        assertTrue(budget(1280, 537, 2) > budget(1280, 537, 1000))
+        assertEquals(0, budget(1280, 1500, 1000))
     }
 
     @Test
-    fun `budget goes non-positive for a context too small to hold any tool`() {
-        // 1280t (qwen3 ekv1280) -> 2560 - 3500 < 0, so no tool is declared at all rather
-        // than one being forced in over budget.
-        assertTrue("tiny context yields no tool room", budget(1280) <= 0)
+    fun `tool budget is never negative and never takes over half the input`() {
+        assertEquals(0, budget(1280, 99999, 99999))
+        assertEquals(0, budget(0, 0, 0))
+        assertTrue(budget(32768, 0, 0) <= LiteRtProvider.promptInputCharBudget(32768) / 2)
     }
 
     @Test
-    fun `declarations are taken until the budget is spent and the rest reported`() {
-        val costs = listOf(100, 100, 100, 100)
-        val charBudget = 250
-        var used = 0
-        val dropped = mutableListOf<Int>()
-        val kept = costs.filterIndexed { index, cost ->
-            if (used + cost > charBudget) {
-                dropped += index
-                false
-            } else {
-                used += cost
-                true
-            }
-        }
-        assertEquals("only whole declarations that fit are kept", listOf(100, 100), kept)
-        assertEquals(200, used)
-        assertEquals("the overflow is reported, not silently swallowed", listOf(2, 3), dropped)
+    fun `history limit subtracts actual tool declaration cost`() {
+        assertEquals(2304 - 537 - 300,
+            LiteRtProvider.historyCharBudget(1280, 537, 300))
+        assertEquals(0, LiteRtProvider.historyCharBudget(1280, 2304, 300))
+    }
+
+    @Test
+    fun `all prompt components fit the estimated input allowance`() {
+        val engine = LiteRtProvider.engineContextTokens(1280, 1280)
+        val system = 537
+        val newest = 2
+        val toolCost = 300
+        assertTrue(toolCost <= budget(engine, system, newest))
+        val history = LiteRtProvider.historyCharBudget(engine, system, toolCost)
+        assertTrue(system + toolCost + history <= LiteRtProvider.promptInputCharBudget(engine))
+        assertTrue(history >= newest)
     }
 }
 
@@ -167,10 +156,15 @@ class LiteRtEngineContextTokensTest {
         // The regression this guards: budget(ceiling) was handed to an engine sized at the
         // allocation, so the committed prefill could run past what the engine can hold.
         val engine = LiteRtProvider.engineContextTokens(4096, 32768)
-        val committedChars = 500 + 3000 + LiteRtProvider.toolDeclarationCharBudget(engine)
+        val systemChars = 500
+        val latestTurnChars = 300
+        val toolBudget = LiteRtProvider.toolDeclarationCharBudget(
+            engine, systemChars, latestTurnChars)
+        val historyBudget = LiteRtProvider.historyCharBudget(engine, systemChars, toolBudget)
+        val committedChars = systemChars + toolBudget + historyBudget
         assertTrue(
-            "prefill budget ${committedChars}c must fit the engine's ${engine}t",
-            committedChars <= engine * 4,
+            "prefill budget ${committedChars}c must fit the engine's input allowance",
+            committedChars <= LiteRtProvider.promptInputCharBudget(engine),
         )
     }
 }

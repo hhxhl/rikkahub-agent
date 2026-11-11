@@ -333,8 +333,10 @@ class LiteRtRuntime(private val context: Context) {
      * an Engine reload. When this is unchanged the warm Conversation (and its KV cache) is
      * kept across [ensureLoaded] calls.
      */
-    private data class ConversationKey(
+    internal data class ConversationKey(
         val systemInstructionText: String?,
+        /** Full tool JSON, so changing names OR schemas invalidates the warm KV cache. */
+        val toolDeclarationJsons: List<String>,
         val constrainedDecoding: Boolean,
         val topK: Int,
         val topP: Double,
@@ -440,6 +442,7 @@ class LiteRtRuntime(private val context: Context) {
         visionAccelerator: String = "gpu",
         systemInstructionText: String? = null,
         tools: List<ToolProvider> = emptyList(),
+        toolDeclarationJsons: List<String> = emptyList(),
         constrainedDecoding: Boolean = false,
         topK: Int = 64,
         topP: Double = 0.95,
@@ -490,6 +493,7 @@ class LiteRtRuntime(private val context: Context) {
             if (!systemInstructionText.isNullOrBlank()) Contents.of(systemInstructionText) else null
         val desiredConversationKey = ConversationKey(
             systemInstructionText = systemInstructionText?.takeIf { it.isNotBlank() },
+            toolDeclarationJsons = toolDeclarationJsons.toList(),
             constrainedDecoding = constrainedDecoding,
             topK = topK,
             topP = topP,

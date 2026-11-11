@@ -25,6 +25,26 @@ import org.junit.Test
  */
 class LiteRtRuntimeTest {
 
+    @Test
+    fun `conversation key changes when tool declarations change`() {
+        val original = LiteRtRuntime.ConversationKey(
+            systemInstructionText = "hello",
+            toolDeclarationJsons = listOf("{\"name\":\"get_time\"}"),
+            constrainedDecoding = true,
+            topK = 64,
+            topP = 0.95,
+            temperature = 1.0,
+        )
+        assertEquals(original, original.copy(toolDeclarationJsons = original.toolDeclarationJsons.toList()))
+        assertFalse(original == original.copy(
+            toolDeclarationJsons = listOf("{\"name\":\"get_weather\"}"),
+        ))
+        assertFalse(original == original.copy(
+            toolDeclarationJsons = listOf("{\"name\":\"get_time\",\"description\":\"changed\"}"),
+        ))
+    }
+
+
     // ---- planTurns -----------------------------------------------------------------
 
     private val u1 = turnSignature(ROLE_USER, "hello")
