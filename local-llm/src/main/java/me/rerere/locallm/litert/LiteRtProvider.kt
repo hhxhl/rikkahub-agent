@@ -360,15 +360,16 @@ class LiteRtProvider(
         val turns = trimmed.map { it.toTurn() }
 
         val prefillChars = combinedSystem.length + toolCharsUsed + coldBlob.length
+        val conservativePrefillTokens =
+            LiteRtConversationPolicy.estimateTextTokens(combinedSystem) +
+                toolJsons.sumOf { LiteRtConversationPolicy.estimateTextTokens(it) } +
+                LiteRtConversationPolicy.estimateTextTokens(coldBlob)
         Log.i(
             TAG,
             "prefill budget: system=${combinedSystem.length} tools=$toolCharsUsed " +
                 "history=${coldBlob.length} total=${prefillChars}c " +
                 "(limit=${inputCharLimit}c, ~${prefillChars / CHARS_PER_TOKEN}t " +
-                "of ${contextTokens}t; conservative token estimate=" +
-                "${LiteRtConversationPolicy.estimateTextTokens(combinedSystem) + " +
-                "toolJsons.sumOf { LiteRtConversationPolicy.estimateTextTokens(it) } + " +
-                "LiteRtConversationPolicy.estimateTextTokens(coldBlob)})",
+                "of ${contextTokens}t; conservative token estimate=${conservativePrefillTokens})",
         )
         if (trimmed.size < allTurns.size) {
             Log.i(TAG, "trimmed conversation history: ${allTurns.size} -> ${trimmed.size} turns")
