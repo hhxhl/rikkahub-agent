@@ -578,34 +578,54 @@ class LiteRtProvider(
             }
         }
 
-        // ---- Persist tok/s telemetry --------------------------------------------------
-        // After a clean stream the runtime stamps lastTelemetry with prefill / decode
-        // timings and character counts. Persist it per-model so the Settings page can
-        // render "Last gen: 12.4 tok/s prefill, 2.7 tok/s decode" without re-running
-        // inference. Best-effort: a write failure must never break the user's reply.
+        // ---- Persist native token-level telemetry --------------------------------------
+        // A 0.19.1 Engine with benchmarking enabled reports actual token counts and tok/s.
+        // Do not persist character/4 estimates as if they were native token rates.
         runtime.lastTelemetry?.let { tele ->
-            // Only persist samples with non-trivial timings — a zero-decode case would
-            // be the SDK emitting no tokens, which is already a bug we want to see
-            // elsewhere; persisting tps=0 muddies the rolling average.
             if (tele.decodeMs > 100 && tele.outputCharCount > 0) {
-                runCatching {
-                    prefs.setPerfTelemetry(
-                        LocalRuntime.LiteRT,
-                        LocalRuntimePreferences.PerfSample(
-                            modelId = params.model.modelId,
-                            prefillTps = tele.prefillTps,
-                            decodeTps = tele.decodeTps,
-                            specDecodingEngaged = tele.specDecodingEngaged,
-                            sampledAtMs = System.currentTimeMillis(),
-                        ),
+                val native = tele.nativeBenchmark
+                val prefillTps = tele.prefillTps
+                val decodeTps = tele.decodeTps
+                val usableNativeSample = native != null && prefillTps != null &&
+                    decodeTps != null && native.lastDecodeTokenCount > 0
+                if (usableNativeSample && native != null && prefillTps != null && decodeTps != null) {
+                    runCatching {
+                        prefs.setPerfTelemetry(
+                            LocalRuntime.LiteRT,
+                            LocalRuntimePreferences.PerfSample(
+                                modelId = params.model.modelId,
+                                prefillTps = prefillTps,
+                                decodeTps = decodeTps,
+                                specDecodingEngaged = tele.specDecodingEngaged,
+                                sampledAtMs = System.currentTimeMillis(),
+                            ),
+                        )
+                    }.onFailure { Log.w(TAG, "setPerfTelemetry failed", it) }
+                    Log.i(
+                        TAG,
+                        "telemetry(native): backend=${tele.accelerator} " +
+                            "prefill=${"%.2f".format(prefillTps)} tok/s " +
+                            "decode=${"%.2f".format(decodeTps)} tok/s " +
+                            "prefillTokens=${native.lastPrefillTokenCount} " +
+                            "decodeTokens=${native.lastDecodeTokenCount} " +
+                            "nativeTtftSec=${native.timeToFirstTokenInSecond} " +
+                            "kvCapacity=${native.maxNumTokens} " +
+                            "kvCacheTokens=${tele.kvCacheTokens ?: "n/a"} " +
+                            "(firstCallbackMs=${tele.prefillMs} afterFirstCallbackMs=${tele.decodeMs} " +
+                            "inChars=${tele.inputCharCount} outChars=${tele.outputCharCount} " +
+                            "specDecoding=${tele.specDecodingEngaged})",
                     )
-                }.onFailure { Log.w(TAG, "setPerfTelemetry failed", it) }
-                Log.i(
-                    TAG,
-                    "telemetry: prefill=${"%.2f".format(tele.prefillTps)} tok/s decode=${"%.2f".format(tele.decodeTps)} tok/s " +
-                        "(prefillMs=${tele.prefillMs} decodeMs=${tele.decodeMs} inChars=${tele.inputCharCount} outChars=${tele.outputCharCount} " +
-                        "specDecoding=${tele.specDecodingEngaged})",
-                )
+                } else {
+                    val charRate = tele.outputCharCount * 1000.0 / tele.decodeMs
+                    Log.w(
+                        TAG,
+                        "telemetry(native unavailable): backend=${tele.accelerator} " +
+                            "output=${"%.2f".format(charRate)} chars/s " +
+                            "(firstCallbackMs=${tele.prefillMs} afterFirstCallbackMs=${tele.decodeMs} " +
+                            "inChars=${tele.inputCharCount} outChars=${tele.outputCharCount}; " +
+                            "no token-rate sample persisted)",
+                    )
+                }
             }
         }
 

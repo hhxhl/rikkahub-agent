@@ -1,0 +1,217 @@
+--- a/local-llm/src/main/java/me/rerere/locallm/litert/LiteRtRuntime.kt
++++ b/local-llm/src/main/java/me/rerere/locallm/litert/LiteRtRuntime.kt
+@@ -6,6 +6,7 @@
+ import android.os.PerformanceHintManager
+ import android.os.Process
+ import com.google.ai.edge.litertlm.Backend
++import com.google.ai.edge.litertlm.BenchmarkInfo
+ import com.google.ai.edge.litertlm.ModelInfo
+ import com.google.ai.edge.litertlm.Content
+ import com.google.ai.edge.litertlm.Contents
+@@ -247,11 +248,10 @@
+         private set
+ 
+     /**
+-     * Per-stream timing + token counts. `prefillTps` = input tokens / time from
+-     * `sendMessageAsync` to first `onMessage`; `decodeTps` = output tokens / time from
+-     * first onMessage to onDone. Token counts are character-based estimates (cumulative
+-     * String.length divided by ~4 chars/token) because the SDK does not surface a per-call
+-     * tokenizer counter — accurate within ~10% for English text, less for CJK.
++     * Application-level callback timings plus optional LiteRT-LM 0.19.1 native benchmark.
++     * prefillMs is send-to-first-callback (NOT pure native prefill time); decodeMs is
++     * first-callback-to-done (NOT pure native decode time). The native benchmark owns
++     * actual token counts and tok/s. Never infer tokens from UTF-16 character length.
+      */
+     data class StreamTelemetry(
+         val prefillMs: Long,
+@@ -259,18 +259,16 @@
+         val inputCharCount: Int,
+         val outputCharCount: Int,
+         val specDecodingEngaged: Boolean,
++        val accelerator: String,
++        val nativeBenchmark: BenchmarkInfo? = null,
++        val kvCacheTokens: Int? = null,
+     ) {
+-        val prefillTps: Double = if (prefillMs > 0)
+-            (inputCharCount.toDouble() / CHARS_PER_TOKEN) * 1000.0 / prefillMs else 0.0
+-        val decodeTps: Double = if (decodeMs > 0)
+-            (outputCharCount.toDouble() / CHARS_PER_TOKEN) * 1000.0 / decodeMs else 0.0
+-
+-        companion object {
+-            /** Conservative estimate. Underestimates speed for English (true rate ~3.5
+-             *  chars/token) and overestimates for CJK (~1.5 chars/token), but consistent
+-             *  enough for relative speed comparisons across runs on the same model. */
+-            const val CHARS_PER_TOKEN: Int = 4
+-        }
++        val prefillTps: Double?
++            get() = nativeBenchmark?.lastPrefillTokensPerSecond
++                ?.takeIf { it.isFinite() && it >= 0.0 }
++        val decodeTps: Double?
++            get() = nativeBenchmark?.lastDecodeTokensPerSecond
++                ?.takeIf { it.isFinite() && it > 0.0 }
+     }
+ 
+     // ---- Idle teardown ----
+@@ -779,6 +777,9 @@
+         val engine = withContext(Dispatchers.IO) {
+             // The flag dance: set BEFORE constructing the Engine, reset AFTER initialize().
+             ExperimentalFlags.enableSpeculativeDecoding = engineKey.speculativeDecoding
++            // LiteRT-LM 0.19.1 reads this flag when constructing a new Engine.
++            // A reused Engine keeps its benchmark configuration.
++            ExperimentalFlags.enableBenchmark = true
+             val e = try {
+                 Engine(engineConfig).also { built ->
+                     try {
+@@ -792,6 +793,7 @@
+                 }
+             } finally {
+                 ExperimentalFlags.enableSpeculativeDecoding = false
++                ExperimentalFlags.enableBenchmark = false
+             }
+             e
+         }
+@@ -930,6 +932,8 @@
+             }
+ 
+             val conv = instance.conversation
++            // Never let a failed/cancelled stream expose a previous turn's telemetry.
++            lastTelemetry = null
+             // The other place a broken GPU delegate faults: it can survive engine init and
+             // only die once real work is submitted. Re-arm for every turn; the first token
+             // below disarms.
+@@ -940,11 +944,8 @@
+             for (clip in audioClips) contentList.add(Content.AudioBytes(clip))
+             if (inputText.trim().isNotEmpty()) contentList.add(Content.Text(inputText))
+ 
+-            // Telemetry. We measure character counts as a proxy for token counts (the SDK
+-            // does not surface a per-call tokenizer counter). The cold-path text input
+-            // includes the full history + system prompt; the warm path is just the new
+-            // turn's raw text. Either way `inputText.length` is the prefill character
+-            // budget for this call.
++            // Keep character counts for UI throughput; native BenchmarkInfo provides
++            // actual token counts and tok/s when the SDK benchmark is enabled.
+             val telemetryInputChars = inputText.length
+             val callStartedNs = System.nanoTime()
+             // Set once the SDK reports the generation finished (either way). Read from the
+@@ -985,6 +986,7 @@
+                             trySend(StreamEvent.ToolCalls(fresh))
+                         }
+                     }
++                    @OptIn(ExperimentalApi::class)
+                     override fun onDone() {
+                         val fullResponse = responseBuilder.toString()
+                         // The Conversation's KV cache now holds [history…] + the assistant
+@@ -994,8 +996,20 @@
+                         instance.processed.clear()
+                         instance.processed.addAll(historySignatures)
+                         instance.processed.add(turnSignature(ROLE_ASSISTANT, fullResponse))
++                        // Timestamp BEFORE querying native metrics so the telemetry JNI
++                        // call does not inflate application-level decode duration.
++                        val endNs = System.nanoTime()
++                        // Read after the SDK reports the stream finished; this does not
++                        // change how the model generates or how the KV cache is reused.
++                        // If unsupported on a device/backend, retain callback timings
++                        // and omit native tok/s rather than publishing fake values.
++                        val nativeBenchmark = runCatching { conv.getBenchmarkInfo() }
++                            .onFailure { android.util.Log.w(
++                                "LiteRtRuntime", "Native benchmark unavailable", it,
++                            ) }
++                            .getOrNull()
++                        val kvCacheTokens = runCatching { conv.getTokenCount() }.getOrNull()
+                         // Stamp telemetry for the provider to read + persist.
+-                        val endNs = System.nanoTime()
+                         val prefillMs = if (firstMessageNs > 0L)
+                             (firstMessageNs - callStartedNs) / 1_000_000L else 0L
+                         val decodeMs = if (firstMessageNs > 0L)
+@@ -1006,6 +1020,9 @@
+                             inputCharCount = telemetryInputChars,
+                             outputCharCount = fullResponse.length,
+                             specDecodingEngaged = instance.speculativeDecodingEngaged,
++                            accelerator = instance.engineKey.accelerator,
++                            nativeBenchmark = nativeBenchmark,
++                            kvCacheTokens = kvCacheTokens,
+                         )
+                         instance.lastUseAtMs = android.os.SystemClock.elapsedRealtime()
+                         generationFinished.set(true)
+--- a/local-llm/src/main/java/me/rerere/locallm/litert/LiteRtProvider.kt
++++ b/local-llm/src/main/java/me/rerere/locallm/litert/LiteRtProvider.kt
+@@ -578,34 +578,54 @@
+             }
+         }
+ 
+-        // ---- Persist tok/s telemetry --------------------------------------------------
+-        // After a clean stream the runtime stamps lastTelemetry with prefill / decode
+-        // timings and character counts. Persist it per-model so the Settings page can
+-        // render "Last gen: 12.4 tok/s prefill, 2.7 tok/s decode" without re-running
+-        // inference. Best-effort: a write failure must never break the user's reply.
++        // ---- Persist native token-level telemetry --------------------------------------
++        // A 0.19.1 Engine with benchmarking enabled reports actual token counts and tok/s.
++        // Do not persist character/4 estimates as if they were native token rates.
+         runtime.lastTelemetry?.let { tele ->
+-            // Only persist samples with non-trivial timings — a zero-decode case would
+-            // be the SDK emitting no tokens, which is already a bug we want to see
+-            // elsewhere; persisting tps=0 muddies the rolling average.
+             if (tele.decodeMs > 100 && tele.outputCharCount > 0) {
+-                runCatching {
+-                    prefs.setPerfTelemetry(
+-                        LocalRuntime.LiteRT,
+-                        LocalRuntimePreferences.PerfSample(
+-                            modelId = params.model.modelId,
+-                            prefillTps = tele.prefillTps,
+-                            decodeTps = tele.decodeTps,
+-                            specDecodingEngaged = tele.specDecodingEngaged,
+-                            sampledAtMs = System.currentTimeMillis(),
+-                        ),
++                val native = tele.nativeBenchmark
++                val prefillTps = tele.prefillTps
++                val decodeTps = tele.decodeTps
++                val usableNativeSample = native != null && prefillTps != null &&
++                    decodeTps != null && native.lastDecodeTokenCount > 0
++                if (usableNativeSample && native != null && prefillTps != null && decodeTps != null) {
++                    runCatching {
++                        prefs.setPerfTelemetry(
++                            LocalRuntime.LiteRT,
++                            LocalRuntimePreferences.PerfSample(
++                                modelId = params.model.modelId,
++                                prefillTps = prefillTps,
++                                decodeTps = decodeTps,
++                                specDecodingEngaged = tele.specDecodingEngaged,
++                                sampledAtMs = System.currentTimeMillis(),
++                            ),
++                        )
++                    }.onFailure { Log.w(TAG, "setPerfTelemetry failed", it) }
++                    Log.i(
++                        TAG,
++                        "telemetry(native): backend=${tele.accelerator} " +
++                            "prefill=${"%.2f".format(prefillTps)} tok/s " +
++                            "decode=${"%.2f".format(decodeTps)} tok/s " +
++                            "prefillTokens=${native.lastPrefillTokenCount} " +
++                            "decodeTokens=${native.lastDecodeTokenCount} " +
++                            "nativeTtftSec=${native.timeToFirstTokenInSecond} " +
++                            "kvCapacity=${native.maxNumTokens} " +
++                            "kvCacheTokens=${tele.kvCacheTokens ?: "n/a"} " +
++                            "(firstCallbackMs=${tele.prefillMs} afterFirstCallbackMs=${tele.decodeMs} " +
++                            "inChars=${tele.inputCharCount} outChars=${tele.outputCharCount} " +
++                            "specDecoding=${tele.specDecodingEngaged})",
+                     )
+-                }.onFailure { Log.w(TAG, "setPerfTelemetry failed", it) }
+-                Log.i(
+-                    TAG,
+-                    "telemetry: prefill=${"%.2f".format(tele.prefillTps)} tok/s decode=${"%.2f".format(tele.decodeTps)} tok/s " +
+-                        "(prefillMs=${tele.prefillMs} decodeMs=${tele.decodeMs} inChars=${tele.inputCharCount} outChars=${tele.outputCharCount} " +
+-                        "specDecoding=${tele.specDecodingEngaged})",
+-                )
++                } else {
++                    val charRate = tele.outputCharCount * 1000.0 / tele.decodeMs
++                    Log.w(
++                        TAG,
++                        "telemetry(native unavailable): backend=${tele.accelerator} " +
++                            "output=${"%.2f".format(charRate)} chars/s " +
++                            "(firstCallbackMs=${tele.prefillMs} afterFirstCallbackMs=${tele.decodeMs} " +
++                            "inChars=${tele.inputCharCount} outChars=${tele.outputCharCount}; " +
++                            "no token-rate sample persisted)",
++                    )
++                }
+             }
+         }
+ 
